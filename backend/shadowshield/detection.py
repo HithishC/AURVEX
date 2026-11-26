@@ -2,14 +2,47 @@ from __future__ import annotations
 
 from .fingerprint import comparable_mismatches
 from .risk import calculate_risk
+from .oui import lookup_vendor, mac_address_kind
 
 
-def _has_usable_identity(observed: dict) -> bool:
+# Identity-tier thresholds, counted over five independent signals:
+# IP, hostname, vendor, protocol evidence, port evidence.
+#
+#   0-1 signals  -> "Insufficient" (a single signal, e.g. IP alone, is
+#                   explicitly not enough per design requirement).
+#   2 signals    -> "Partial" (some identity evidence, but not enough
+#                   to confidently call a baseline mismatch "Changed").
+#   3+ signals   -> "Strong" (enough independent corroborating evidence
+#                   to trust a status decision). Missing vendor or
+#                   hostname alone never drops a device below "Strong"
+#                   as long as other signals are present.
+IDENTITY_TIER_INSUFFICIENT_MAX = 1
+IDENTITY_TIER_PARTIAL_MAX = 2
+
+
+def _resolve_vendor(observed: dict) -> tuple[str, str]:
     """
-    Check whether the observation has useful identity evidence.
-    A MAC address alone is not sufficient for this check.
+    Fill in a vendor name from the local OUI table when the observed
+    record has none. Never invents a name: falls back to "" with
+    source "unavailable" when the OUI is unknown, locally administered,
+    multicast, or invalid.
     """
 
+    vendor = str(observed.get("vendor", "")).strip()
+
+    if vendor:
+        return vendor, "observed"
+
+    mac = str(observed.get("mac", "")).strip()
+    looked_up = lookup_vendor(mac)
+
+    if looked_up != "Unknown":
+        return looked_up, "oui_lookup"
+
+    return "", "unavailable"
+
+
+def _identity_signals(observed: dict, vendor: str) -> dict:
     ip = str(observed.get("ip", "")).strip().lower()
 
     invalid_ips = {
@@ -21,17 +54,66 @@ def _has_usable_identity(observed: dict) -> bool:
         "-",
     }
 
-    has_ip = ip not in invalid_ips
+    return {
+        "ip": ip not in invalid_ips,
+        "hostname": bool(str(observed.get("hostname", "")).strip()),
+        "vendor": bool(vendor.strip()),
+        "protocols": bool(observed.get("protocols")),
+        "ports": bool(observed.get("ports")),
+    }
 
-    has_hostname = bool(
-        str(observed.get("hostname", "")).strip()
+
+def _identity_tier(signals: dict) -> str:
+    """
+    Strong / Partial / Insufficient classification used to decide
+    whether a status conclusion (Known/Unknown/Changed) can be trusted,
+    or whether evidence is too thin (Insufficient Evidence) or
+    ambiguous against a baseline (Review Required).
+    """
+
+    present = sum(signals.values())
+
+    if present <= IDENTITY_TIER_INSUFFICIENT_MAX:
+        return "Insufficient"
+
+    if present <= IDENTITY_TIER_PARTIAL_MAX:
+        return "Partial"
+
+    return "Strong"
+
+
+def _evidence_quality(observed: dict, signals: dict | None = None) -> tuple[str, list[str]]:
+    """
+    Transparent evidence-quality assessment, separate from the
+    Known/Unknown/Changed/Insufficient Evidence status. This explains
+    *why* a device's identity evidence is strong or weak, independent
+    of whether it happens to match an approved-inventory baseline.
+    """
+
+    signals = signals if signals is not None else _identity_signals(
+        observed, str(observed.get("vendor", ""))
     )
 
-    has_vendor = bool(
-        str(observed.get("vendor", "")).strip()
-    )
+    reasons = []
 
-    return has_ip or has_hostname or has_vendor
+    if not signals["ip"]:
+        reasons.append("No usable IP address observed.")
+    if not signals["hostname"]:
+        reasons.append("No hostname observed.")
+    if not signals["vendor"]:
+        reasons.append("No vendor/OUI information available.")
+    if not signals["protocols"]:
+        reasons.append("No protocol evidence observed.")
+    if not signals["ports"]:
+        reasons.append("No port activity observed.")
+
+    tier = _identity_tier(signals)
+    quality = {"Insufficient": "Low", "Partial": "Medium", "Strong": "High"}[tier]
+
+    if not reasons:
+        reasons.append("All identity evidence fields are present.")
+
+    return quality, reasons
 
 
 def _authorization_status(status: str) -> tuple[str, str]:
@@ -51,6 +133,12 @@ def _authorization_status(status: str) -> tuple[str, str]:
         "Changed": (
             "Review Required",
             "Observed device details differ from approved inventory.",
+        ),
+        "Review Required": (
+            "Review Required",
+            "Observed evidence conflicts with the approved baseline, "
+            "but identity evidence is too thin to confirm the change "
+            "with confidence. Manual verification is required.",
         ),
         "Insufficient Evidence": (
             "Review Required",
@@ -79,9 +167,15 @@ def compare_device(
 
     approved = approved_by_mac.get(mac)
 
+    vendor, vendor_source = _resolve_vendor(observed)
+    observed = {**observed, "vendor": vendor}
+
+    signals = _identity_signals(observed, vendor)
+    identity_tier = _identity_tier(signals)
+
     mismatches = []
 
-    if not _has_usable_identity(observed):
+    if identity_tier == "Insufficient":
         status = "Insufficient Evidence"
 
     elif approved is None:
@@ -93,11 +187,16 @@ def compare_device(
             approved,
         )
 
-        status = (
-            "Changed"
-            if mismatches
-            else "Known"
-        )
+        if not mismatches:
+            status = "Known"
+        elif identity_tier == "Strong":
+            # Enough corroborating evidence to trust the mismatch.
+            status = "Changed"
+        else:
+            # Partial evidence + a mismatch is ambiguous: it could be a
+            # real change or thin data producing a false mismatch.
+            # Flag for manual review instead of asserting either way.
+            status = "Review Required"
 
     authorization, authorization_reason = (
         _authorization_status(status)
@@ -110,6 +209,8 @@ def compare_device(
         policy,
     )
 
+    evidence_quality, evidence_reasons = _evidence_quality(observed, signals)
+
     return {
         **observed,
 
@@ -117,6 +218,13 @@ def compare_device(
 
         "authorization_status": authorization,
         "authorization_reason": authorization_reason,
+
+        "evidence_quality": evidence_quality,
+        "evidence_reasons": evidence_reasons,
+        "identity_tier": identity_tier,
+
+        "vendor_source": vendor_source,
+        "mac_address_kind": mac_address_kind(mac),
 
         "risk_score": risk["score"],
         "risk_band": risk["band"],
