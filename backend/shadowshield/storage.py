@@ -388,6 +388,36 @@ def get_analysis(
     return data
 
 
+def get_observations(
+    analysis_id: str,
+    db_path: str = DB_PATH,
+) -> list[dict]:
+    """
+    Read-only accessor for the raw observation rows belonging to one
+    analysis. Added for the repository abstraction layer
+    (shadowshield.repositories) -- no existing caller or endpoint used
+    this before, so this is purely additive.
+    """
+
+    with connect(db_path) as conn:
+        rows = conn.execute("""
+        SELECT *
+        FROM observations
+        WHERE analysis_id=?
+        ORDER BY id
+        """, (analysis_id,)).fetchall()
+
+    items = []
+
+    for row in rows:
+        item = dict(row)
+        item["ports"] = _load(item["ports"])
+        item["protocols"] = _load(item["protocols"])
+        items.append(item)
+
+    return items
+
+
 def get_recent_alerts(
     limit: int = 100,
     db_path: str = DB_PATH,

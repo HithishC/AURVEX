@@ -14,3 +14,9 @@ __pycache__/
 *.pcap
 *.pcapng
 *.log
+*.db.bak
+*.db-backup
+*-firebase-adminsdk-*.json
+*serviceAccount*.json
+*service-account*.json
+firebase-credentials*.json
