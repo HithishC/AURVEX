@@ -102,6 +102,11 @@ function normalizeConnectionType(value) {
 }
 
 function normalizeAuthorization(value, approved, backendStatus) {
+  // `approved` reflects the current approved-inventory lookup and must win
+  // over `value`, which can be a status string frozen inside an older,
+  // already-stored analysis result from before the device was approved.
+  if (approved) return 'Authorized';
+
   const status = String(value || '').trim().toLowerCase();
 
   if (status === 'authorized') return 'Authorized';
@@ -115,7 +120,7 @@ function normalizeAuthorization(value, approved, backendStatus) {
     return 'Review Required';
   }
 
-  if (approved || backendStatus === 'known') {
+  if (backendStatus === 'known') {
     return 'Authorized';
   }
 
@@ -167,13 +172,14 @@ function mapDevice(device, approved = false) {
           : 'unknown',
 
     authorizationStatus,
-    authorizationReason:
-      device.authorization_reason ||
-      (authorizationStatus === 'Authorized'
-        ? 'Device is in the approved inventory.'
-        : authorizationStatus === 'Unauthorized'
-          ? 'Device is not in the approved inventory.'
-          : 'Additional device information is required for review.'),
+    authorizationReason: approved
+      ? 'Device is in the approved inventory.'
+      : device.authorization_reason ||
+        (authorizationStatus === 'Authorized'
+          ? 'Device is in the approved inventory.'
+          : authorizationStatus === 'Unauthorized'
+            ? 'Device is not in the approved inventory.'
+            : 'Additional device information is required for review.'),
 
     risk: normalizeRisk(device.risk_band, score),
     score: score / 100,
